@@ -32,7 +32,7 @@ jobs:
     name: Decide whether this push needs a release
     runs-on: ubuntu-latest
     outputs:
-      docs_only: ${{ steps.check.outputs.docs_only }}
+      skip_release: ${{ steps.check.outputs.skip_release }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,12 +40,12 @@ jobs:
           # Needed to diff against the pushed-from commit.
           fetch-depth: 0
 
-      - name: Check whether the push is docs-only
+      - name: Check whether anything in this push reaches the plugin
         id: check
         run: |
           set -euo pipefail
 
-          release() { echo "docs_only=false" >> "$GITHUB_OUTPUT"; }
+          release() { echo "skip_release=false" >> "$GITHUB_OUTPUT"; }
 
           if [[ "${{ github.event_name }}" != "push" ]]; then
             echo "Event is ${{ github.event_name }}, not a push - releasing."
@@ -71,25 +71,36 @@ jobs:
             release; exit 0
           fi
 
-          # Deliberately conservative: only these count as prose. Anything else,
-          # including build files, resources and source, is a real change.
+          # Deliberately conservative: only these cannot reach the built jar.
+          # Anything else, including build files, resources and source, is a real
+          # change.
+          #
           # The LICENSE/NOTICE alternatives are spelled out rather than using
           # `(^|/)`, whose behaviour differs between grep implementations.
-          NON_DOCS=$(printf '%s\n' "$CHANGED" \
-            | grep -vE '\.(md|txt)$|^docs/|^(LICENSE|NOTICE)$|/(LICENSE|NOTICE)$' || true)
+          #
+          # The dev dotfiles are matched at the REPO ROOT ONLY, with no `/` variant.
+          # A file named `.gitignore` under `src/main/resources/` would be copied
+          # into the jar by processResources like any other resource, so a path-
+          # anywhere match would skip a release for a change that really did ship.
+          # Root-anchored is the version that cannot be wrong.
+          #
+          # `.github/**` is deliberately NOT here: a workflow change can alter the
+          # artifact, and that was decided when this gate was written.
+          NON_SHIPPED=$(printf '%s\n' "$CHANGED" \
+            | grep -vE '\.(md|txt)$|^docs/|^(LICENSE|NOTICE)$|/(LICENSE|NOTICE)$|^(\.gitignore|\.gitattributes|\.editorconfig)$' || true)
 
-          if [[ -z "$NON_DOCS" ]]; then
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Docs-only push - skipping the release. Use workflow_dispatch to force one."
+          if [[ -z "$NON_SHIPPED" ]]; then
+            echo "skip_release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Nothing in this push reaches the built plugin - skipping the release. Use workflow_dispatch to force one."
           else
-            echo "Non-docs changes present:"
-            printf '%s\n' "$NON_DOCS" | sed 's/^/  /'
+            echo "Changes that can reach the artifact:"
+            printf '%s\n' "$NON_SHIPPED" | sed 's/^/  /'
             release
           fi
 
   release:
     needs: detect
-    if: needs.detect.outputs.docs_only != 'true'
+    if: needs.detect.outputs.skip_release != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
