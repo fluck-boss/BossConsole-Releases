@@ -1,0 +1,362 @@
+name: Update Homebrew Distribution
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      version:
+        description: 'Version to update (e.g., 8.11.3)'
+        required: true
+        type: string
+      skip_official_pr:
+        description: 'Skip creating PR to official homebrew-cask (only update tap)'
+        required: false
+        type: boolean
+        default: false
+      pr_message:
+        description: 'Custom message to append to official PR (e.g., "Critical crash fix for Apple Silicon")'
+        required: false
+        type: string
+
+env:
+  GRADLE_OPTS: '-Dorg.gradle.daemon=false'
+
+jobs:
+  update-homebrew:
+    name: Update Homebrew Distribution
+    runs-on: ubuntu-latest
+    if: "!github.event.release.prerelease"
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Extract release information and check version type
+        id: release_info
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Manual trigger - use input version
+            VERSION="${{ github.event.inputs.version }}"
+            RELEASE_URL="https://github.com/risa-labs-inc/BossConsole-Releases/releases/tag/v${VERSION}"
+            echo "🔧 Manual trigger for version: $VERSION"
+            
+            # Check if user wants to skip official PR
+            if [[ "${{ github.event.inputs.skip_official_pr }}" == "true" ]]; then
+              echo "⏭️ Manual trigger with skip official PR option enabled"
+              TRIGGER_TYPE="manual_skip_pr"
+            else
+              echo "🚀 Manual trigger with official PR creation enabled"
+              TRIGGER_TYPE="manual"
+            fi
+          else
+            # Release trigger - extract from tag and check if it's minor/major
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            RELEASE_URL="${{ github.event.release.html_url }}"
+            
+            # Parse version to determine if it's patch (x.y.z where z > 0) vs minor/major
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+            
+            if [[ "$PATCH" != "0" ]]; then
+              echo "🔄 Patch release detected ($VERSION) - skipping automatic Homebrew update"
+              echo "Use manual trigger for patch releases to avoid spam"
+              TRIGGER_TYPE="patch_skip"
+            else
+              echo "🚀 Major/Minor release trigger for version: $VERSION"
+              TRIGGER_TYPE="auto_major_minor"
+            fi
+          fi
+          
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "RELEASE_URL=$RELEASE_URL" >> $GITHUB_OUTPUT
+          echo "TRIGGER_TYPE=$TRIGGER_TYPE" >> $GITHUB_OUTPUT
+          echo "ASSET_NAME=BOSS-${VERSION}-Universal.dmg" >> $GITHUB_OUTPUT
+          # Deliberately a pinned, versioned URL rather than a `latest-release`
+          # link: a Homebrew cask pairs its url with a sha256, so it cannot
+          # point at a moving target. GitHub is the primary source here for a
+          # reason too — this job runs on `release: published`, which fires
+          # before sync-release finishes uploading the assets to the bucket, so
+          # the CDN copy may not exist yet. It is the fallback, not the default.
+          echo "DOWNLOAD_URL=https://github.com/risa-labs-inc/BossConsole-Releases/releases/download/v${VERSION}/BOSS-${VERSION}-Universal.dmg" >> $GITHUB_OUTPUT
+          echo "FALLBACK_DOWNLOAD_URL=https://api.risaboss.com/storage/v1/object/public/app-releases/boss/${VERSION}/BOSS-${VERSION}-Universal.dmg" >> $GITHUB_OUTPUT
+          echo "PR_MESSAGE=${{ github.event.inputs.pr_message || '' }}" >> $GITHUB_OUTPUT
+          echo "📦 Processing BOSS release $VERSION"
+
+      - name: Skip official PR notification
+        if: steps.release_info.outputs.TRIGGER_TYPE == 'patch_skip' || steps.release_info.outputs.TRIGGER_TYPE == 'manual_skip_pr'
+        run: |
+          if [[ "${{ steps.release_info.outputs.TRIGGER_TYPE }}" == "patch_skip" ]]; then
+            echo "::notice::Patch release detected - updating tap but skipping official Homebrew PR to avoid spam"
+            echo "Tap will be updated automatically, but no PR will be created to homebrew-cask"
+          else
+            echo "::notice::Manual trigger with skip official PR option - updating tap only"
+            echo "Tap will be updated automatically, but no PR will be created to homebrew-cask per user request"
+          fi
+          
+      - name: Calculate SHA256 hash for Homebrew
+        id: calculate_hash
+        run: |
+          set -euo pipefail
+
+          DMG="BOSS-${{ steps.release_info.outputs.VERSION }}-Universal.dmg"
+
+          # Download the DMG file to calculate SHA256. Both sources hold the
+          # same bytes — sync-release uploads the GitHub assets to the bucket
+          # verbatim — so either yields the hash Homebrew users will see.
+          echo "⬇️ Downloading DMG to calculate SHA256..."
+          if ! curl -fsSL -o "$DMG" "${{ steps.release_info.outputs.DOWNLOAD_URL }}"; then
+            echo "::warning::GitHub asset unavailable; falling back to the release CDN"
+            curl -fsSL -o "$DMG" "${{ steps.release_info.outputs.FALLBACK_DOWNLOAD_URL }}"
+          fi
+
+          # Calculate SHA256
+          SHA256=$(sha256sum "$DMG" | cut -d' ' -f1)
+          echo "SHA256=$SHA256" >> $GITHUB_OUTPUT
+          echo "🔒 Calculated SHA256: $SHA256"
+          
+          # Clean up downloaded file
+          rm -f "$DMG"
+
+      - name: Update Homebrew Tap
+        id: update_tap
+        run: |
+          echo "🍺 Updating custom Homebrew tap..."
+          
+          # Clone the tap repository
+          git clone https://${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/risa-labs-inc/homebrew-boss.git homebrew-tap
+          cd homebrew-tap
+          
+          # Configure git
+          git config user.name "Risa Labs"
+          git config user.email "enterprise@risalabs.ai"
+          
+          # Update the cask file
+          VERSION="${{ steps.release_info.outputs.VERSION }}"
+          SHA256="${{ steps.calculate_hash.outputs.SHA256 }}"
+          
+          # Update version and SHA256 in boss.rb
+          sed -i "s/version \"[^\"]*\"/version \"$VERSION\"/" Casks/boss.rb
+          sed -i "s/sha256 \"[^\"]*\"/sha256 \"$SHA256\"/" Casks/boss.rb
+          
+          # Verify changes
+          echo "📝 Updated cask file content:"
+          head -10 Casks/boss.rb
+          
+          # Commit and push changes if there are any
+          git add Casks/boss.rb
+          if git diff --staged --quiet; then
+            echo "ℹ️ No changes to commit - tap already up to date"
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            git commit -m "🚀 Update BOSS to version $VERSION
+
+            Release: ${{ steps.release_info.outputs.RELEASE_URL }}
+            SHA256: $SHA256"
+            
+            # Push with retry logic
+            for i in {1..3}; do
+              if git push; then
+                echo "✅ Successfully pushed to tap repository"
+                echo "success=true" >> $GITHUB_OUTPUT
+                break
+              else
+                echo "❌ Push attempt $i failed, retrying in 5 seconds..."
+                sleep 5
+                git pull --rebase
+              fi
+            done
+          fi
+
+      - name: Setup Homebrew for official PR
+        if: steps.update_tap.outputs.success == 'true' && steps.release_info.outputs.TRIGGER_TYPE != 'patch_skip' && steps.release_info.outputs.TRIGGER_TYPE != 'manual_skip_pr'
+        uses: Homebrew/actions/setup-homebrew@848c272c7bfe984a197bd4d16383f4c106ec61e6
+
+      - name: Create PR to official Homebrew
+        if: steps.update_tap.outputs.success == 'true' && steps.release_info.outputs.TRIGGER_TYPE != 'patch_skip' && steps.release_info.outputs.TRIGGER_TYPE != 'manual_skip_pr'
+        id: create_pr
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_CASK_TOKEN }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_CASK_TOKEN }}
+        run: |
+          echo "🚀 Creating PR to official Homebrew repository..."
+          
+          # Check if token is available
+          if [ -z "$HOMEBREW_GITHUB_API_TOKEN" ]; then
+            echo "⚠️ HOMEBREW_CASK_TOKEN secret not configured"
+            echo "Please add your GitHub token to repository secrets for official Homebrew PRs"
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Update Homebrew database to get latest casks
+          echo "🔄 Updating Homebrew database..."
+          brew update
+          
+          # Verify cask exists after update
+          echo "🔍 Checking if boss cask exists in official Homebrew..."
+          if ! brew info --cask boss >/dev/null 2>&1; then
+            echo "⚠️ boss cask not found in official Homebrew even after update"
+            echo "Available casks matching 'boss':"
+            brew search --cask boss || echo "No casks found matching 'boss'"
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Show current cask info
+          echo "📋 Current boss cask info:"
+          brew info --cask boss
+          
+          # Use existing fork at https://github.com/kshivang/homebrew-cask
+          echo "🚀 Creating PR to homebrew-cask using existing fork..."
+          
+          # Clone the existing fork with token authentication  
+          git clone https://token:$HOMEBREW_GITHUB_API_TOKEN@github.com/kshivang/homebrew-cask.git homebrew-cask-repo
+          cd homebrew-cask-repo
+          
+          # Configure git
+          git config user.name "Risa Labs"
+          git config user.email "enterprise@risalabs.ai"
+          
+          # Verify remotes (origin should be our fork, we'll add upstream for official repo)
+          echo "🔍 Initial git remotes after cloning from fork:"
+          git remote -v
+          
+          # Add upstream remote pointing to official Homebrew repo
+          git remote add upstream https://github.com/Homebrew/homebrew-cask.git
+          
+          # Fetch latest from upstream (official repo)
+          echo "🔄 Fetching latest changes from upstream official repo..."
+          git fetch upstream
+          
+          # Reset our main to match upstream exactly (cleanest approach)
+          git checkout main
+          git reset --hard upstream/main
+          
+          # Force push to sync our fork with upstream
+          echo "📤 Force pushing updated main to our fork..."
+          git push origin main --force
+          
+          # Verify final remote setup
+          echo "🔍 Final git remotes (origin=fork, upstream=official):"
+          git remote -v
+          
+          # Create a new branch for the PR (delete if exists)
+          BRANCH_NAME="bump-boss-${{ steps.release_info.outputs.VERSION }}"
+          
+          # Delete existing branch if it exists (locally and remotely)
+          if git show-ref --verify --quiet refs/heads/$BRANCH_NAME; then
+            echo "🗑️ Deleting existing local branch $BRANCH_NAME"
+            git branch -D $BRANCH_NAME
+          fi
+          
+          if git ls-remote --heads origin $BRANCH_NAME | grep -q $BRANCH_NAME; then
+            echo "🗑️ Deleting existing remote branch $BRANCH_NAME"
+            git push origin --delete $BRANCH_NAME
+          fi
+          
+          # Create fresh branch
+          git checkout -b "$BRANCH_NAME"
+          
+          # Update the boss.rb cask file
+          VERSION="${{ steps.release_info.outputs.VERSION }}"
+          SHA256="${{ steps.calculate_hash.outputs.SHA256 }}"
+          
+          # Find and update the boss cask file
+          CASK_FILE="Casks/b/boss.rb"
+          if [ -f "$CASK_FILE" ]; then
+            echo "📝 Updating $CASK_FILE with version $VERSION"
+            
+            # Update version and SHA256
+            sed -i "s/version \"[^\"]*\"/version \"$VERSION\"/" "$CASK_FILE"
+            sed -i "s/sha256 \"[^\"]*\"/sha256 \"$SHA256\"/" "$CASK_FILE"
+            
+            echo "📋 Updated cask content:"
+            head -10 "$CASK_FILE"
+            
+            # Commit changes
+            git add "$CASK_FILE"
+            git commit -m "boss: update $VERSION
+
+            Release notes:
+            - Updated to version $VERSION
+            - SHA256: $SHA256
+            - Release: ${{ steps.release_info.outputs.RELEASE_URL }}"
+            
+            # Push branch to our fork and create PR
+            git push origin "$BRANCH_NAME"
+            
+            # Prepare PR body with optional custom message
+            PR_BODY="Updates boss cask to version $VERSION"
+            
+            # Add custom message if provided
+            if [[ -n "${{ steps.release_info.outputs.PR_MESSAGE }}" ]]; then
+              PR_BODY="$PR_BODY
+
+            **Note:** ${{ steps.release_info.outputs.PR_MESSAGE }}"
+            fi
+            
+            PR_BODY="$PR_BODY
+
+            **Release Information:**
+            - Version: $VERSION  
+            - SHA256: \`$SHA256\`
+            - Release URL: ${{ steps.release_info.outputs.RELEASE_URL }}
+
+            **Changes:**
+            - Updated version from previous to $VERSION
+            - Updated SHA256 hash for new release asset
+
+            BOSS is an AI-powered workspace for complex business operations."
+            
+            if gh pr create \
+              --repo Homebrew/homebrew-cask \
+              --title "boss: update $VERSION" \
+              --body "$PR_BODY" \
+              --head "kshivang:$BRANCH_NAME"; then
+              echo "✅ Successfully created PR to homebrew-cask"
+              echo "success=true" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Failed to create PR to homebrew-cask"
+              echo "success=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "❌ Could not find boss cask file at $CASK_FILE"
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+          
+          cd ..
+
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🍺 Homebrew Distribution Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Version**: ${{ steps.release_info.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Release**: ${{ steps.release_info.outputs.RELEASE_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🍺 Homebrew Distribution" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.update_tap.outputs.success }}" == "true" ]]; then
+            echo "✅ **Custom Tap**: Updated successfully" >> $GITHUB_STEP_SUMMARY
+            echo "   - SHA256: ${{ steps.calculate_hash.outputs.SHA256 }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Custom Tap**: Failed to update" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [[ "${{ steps.release_info.outputs.TRIGGER_TYPE }}" == "patch_skip" ]]; then
+            echo "⏭️ **Official Homebrew**: Skipped PR for patch release (tap updated)" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ steps.release_info.outputs.TRIGGER_TYPE }}" == "manual_skip_pr" ]]; then
+            echo "⏭️ **Official Homebrew**: Skipped PR per manual trigger option (tap updated)" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ steps.create_pr.outputs.success }}" == "true" ]]; then
+            echo "✅ **Official Homebrew**: PR created successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Official Homebrew**: PR creation failed (tap still updated)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📥 Linux Installation" >> $GITHUB_STEP_SUMMARY
+          echo "For Linux users, download packages directly from:" >> $GITHUB_STEP_SUMMARY
+          echo "https://github.com/risa-labs-inc/BOSS-Kotlin/releases/latest" >> $GITHUB_STEP_SUMMARY
